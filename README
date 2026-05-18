@@ -1,0 +1,8 @@
+# 5G NR Link-Level Simulator
+
+This project is a Python-based 5G NR link-level simulator. It supports OFDM, MIMO, channel models, equalisation, modulation/coding, HARQ, CSI feedback, and adaptive link simulation.
+
+## Main Entry Point
+
+```bash
+python run_sim.py
