@@ -441,7 +441,15 @@ class CDLChannel:
         # If the input is one-dimensional, treat it as a single-antenna signal.
         if tx.ndim == 1:
             tx = tx[np.newaxis, :]
+        
+        if tx.shape[0] == 1 and self.n_tx > 1:
+            tx = np.repeat(tx, self.n_tx, axis=0) / np.sqrt(self.n_tx)
 
+        if tx.shape[0] != self.n_tx:
+            raise ValueError(
+                f"CDLChannel expected tx shape ({self.n_tx}, n_samples), "
+                f"but got {tx.shape}"
+        )
         # Number of time samples.
         n_samples = tx.shape[1]
 

@@ -120,7 +120,17 @@ class LinkSimulator:
 
     def _rx_chain(self, rx_time: np.ndarray) -> tuple[np.ndarray, bool]:
         """time-domain RX → decoded bits + CRC pass/fail (simplified)."""
-        rx_sym = self.demodulator.demodulate(rx_time)
+        if rx_time.ndim == 1:
+            rx_sym = self.demodulator.demodulate(rx_time)
+        else:
+            rx_sym = np.stack([
+                self.demodulator.demodulate(rx_time[rx])
+                for rx in range(rx_time.shape[0])
+            ], axis=0)
+        
+        # Convert multi-RX output to single stream for current estimator
+        if rx_sym.ndim == 2:
+            rx_sym = rx_sym[0]
 
         # Channel estimation (use received signal as pilot proxy for AWGN sim)
         H_est = self.ch_estimator.estimate(rx_sym)
