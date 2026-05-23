@@ -1,8 +1,319 @@
 # 5G NR Link-Level Simulator
 
-This project is a Python-based 5G NR link-level simulator. It supports OFDM, MIMO, channel models, equalisation, modulation/coding, HARQ, CSI feedback, and adaptive link simulation.
+A Python implementation of a 5G NR link-level simulator built from scratch against the 3GPP spec. Every class maps to a specific TS section — the goal was to understand exactly what happens inside a radio stack, not just use a library that hides it.
 
-## Main Entry Point
+The simulator covers the full downlink chain: transport block generation → LDPC/Polar encoding → rate matching → QAM mapping → OFDM modulation → channel (AWGN / Rayleigh / CDL / EPA) → demodulation → channel estimation → equalisation → LLR computation → HARQ combining → decoding → BER/BLER/throughput metrics. There's also a standalone BER sweep module that validates modulation performance against analytical curves.
+
+---
+
+## Project structure
+
+```
+5G-NR-Link-Simulator/
+├── run_sim.py               # CLI entry point, parameter sweep, JSON export
+│
+├── config/
+│   ├── sim_config.py        # SimConfig dataclass — all simulation parameters
+│   └── nr_tables.py         # 3GPP MCS / TBS / CQI lookup tables (TS 38.214)
+│
+├── phy/
+│   ├── ofdm.py              # OFDMModulator — all 5 NR numerologies, CP guard check,
+│   │                        #   DMRS injection, NRFrameStructure, slot/mini-slot map
+│   ├── channel.py           # AWGNChannel, RayleighChannel, FlatRayleighChannel,
+│   │                        #   EPAChannel (7-tap TS 36.104), CDLChannel (A/B/C TS 38.901)
+│   │                        #   + theoretical BER functions
+│   ├── channel_est.py       # LSEstimator, LMMSEEstimator (TS 38.211 §7.4)
+│   ├── equaliser.py         # ZFEqualiser, MMSEEqualiser, SICEqualiser (V-BLAST)
+│   ├── modulation.py        # Mapper, Demapper, LLRComputer (Max-Log-MAP)
+│   └── mimo.py              # MIMOChannel (Kronecker), BeamformingMatrix (DFT codebook)
+│
+├── coding/
+│   ├── ldpc.py              # LDPCEncoder, BPDecoder (sum-product), RateMatch
+│   ├── polar.py             # PolarEncoder (CRC-6), CASCLDecoder (list=8)
+│   └── harq.py              # HARQProcess, HARQManager, SoftBuffer (IR combining)
+│
+├── mac/
+│   ├── amc.py               # LinkAdaptor (CQI→MCS), OLLAController
+│   └── csi.py               # CQIComputer (EESM), PMICodebook, RISelector
+│
+├── sim/
+│   ├── link_sim.py          # LinkSimulator — main simulation engine
+│   ├── metrics.py           # BERCounter, BLERCounter, ThroughputCalc
+│   └── sim_ber.py           # BER sweep engine + matplotlib plots
+│
+└── output/                  # Generated plots land here
+    ├── ber_compare.png
+    ├── frame_structure.png
+    ├── cp_analysis.png
+    └── mcs_comparison.png
+```
+
+---
+
+## Requirements
+
+```
+python >= 3.10
+numpy  >= 1.24
+scipy  >= 1.10
+matplotlib >= 3.7
+```
 
 ```bash
+pip install numpy scipy matplotlib
+```
+
+No other dependencies.
+
+---
+
+## Quickstart
+
+Clone and run with defaults (CDL-A, MCS 16, SNR 15 dB, 500 slots):
+
+```bash
+git clone https://github.com/yourname/5G-NR-Link-Simulator
+cd 5G-NR-Link-Simulator
 python run_sim.py
+```
+
+Single SNR point, AWGN, quiet output:
+
+```bash
+python run_sim.py --channel AWGN --snr 10 --mcs 9 --slots 200 --quiet
+```
+
+SNR sweep from 0 to 25 dB over CDL-A, save results to JSON:
+
+```bash
+python run_sim.py --sweep-snr --snr-min 0 --snr-max 25 --snr-step 5 \
+                  --channel CDL-A --detector MMSE --output results.json
+```
+
+Run the BER validation suite and generate all plots:
+
+```bash
+python sim/sim_ber.py
+# plots saved to output/
+```
+
+---
+
+## CLI reference
+
+```
+Numerology / OFDM
+  --numerology    μ: 0=15kHz, 1=30kHz, 2=60kHz       default: 1
+  --n-prb         Physical Resource Blocks             default: 52
+  --n-fft         FFT size                             default: 2048
+
+Modulation
+  --mcs           MCS index 0-28 (TS 38.214)           default: 16
+  --n-layers      Spatial layers / rank indicator       default: 1
+
+Channel
+  --channel       AWGN | Rayleigh | CDL-A | CDL-B | CDL-C    default: CDL-A
+  --snr           Operating SNR in dB                         default: 15.0
+  --velocity      UE velocity km/h for Doppler                default: 30.0
+
+MIMO
+  --n-tx          Transmit antennas                    default: 4
+  --n-rx          Receive antennas                     default: 2
+  --detector      ZF | MMSE | SIC                      default: MMSE
+
+Simulation control
+  --slots         Slots per SNR point                  default: 500
+  --seed          Random seed                          default: 42
+  --sweep-snr     Run full SNR sweep
+  --snr-min       Sweep start (dB)                     default: -5
+  --snr-max       Sweep end (dB)                       default: 30
+  --snr-step      Sweep step (dB)                      default: 5
+  --output        Save results to JSON
+  --quiet         Suppress per-slot progress output
+```
+
+---
+
+## Configuration
+
+All parameters live in `SimConfig` (config/sim_config.py):
+
+```python
+@dataclass
+class SimConfig:
+    # OFDM
+    numerology:      int   = 1       # μ=1 → 30 kHz SCS
+    n_prb:           int   = 52      # 52 PRBs → 624 active subcarriers
+    n_fft:           int   = 2048
+    cp_len:          int   = 144     # samples (~2.34 μs at μ=1)
+    n_symb_per_slot: int   = 14
+
+    # Modulation
+    mcs:      int = 16               # 16-QAM, R ≈ 0.64
+    n_layers: int = 1
+
+    # Channel
+    channel_model: str   = 'CDL-A'
+    snr_db:        float = 15.0
+    velocity_kmh:  float = 30.0
+
+    # MIMO
+    n_tx:     int = 4
+    n_rx:     int = 2
+    detector: str = 'MMSE'
+```
+
+`__post_init__` auto-derives `scs_khz`, `n_subcarriers`, and `slot_duration_us`.
+
+---
+
+## NR numerologies
+
+All five numerologies from TS 38.211 Table 4.3.2-1. The `OFDMModulator` constructor accepts `max_delay_spread_us` — it raises `ValueError` if the CP is shorter than the supplied delay spread, so misconfigured numerology/channel combinations are caught at startup rather than producing silent ISI.
+
+| μ | SCS | CP normal | Slots/frame | Handles |
+|---|-----|-----------|-------------|---------|
+| 0 | 15 kHz  | 4.6875 μs | 10  | EVA (4 μs) ✓, ETU (5 μs) ✓ |
+| 1 | 30 kHz  | 2.3438 μs | 20  | EPA (410 ns) ✓, CDL-A (750 ns) ✓ |
+| 2 | 60 kHz  | 1.1719 μs | 40  | EPA ✓, CDL-A ✓ |
+| 3 | 120 kHz | 0.5859 μs | 80  | EPA ✓ only |
+| 4 | 240 kHz | 0.2930 μs | 160 | Short delay / AWGN only |
+
+μ=2 also has extended CP (4.1667 μs) via `use_extended_cp=True`.
+
+---
+
+## Channel models
+
+**AWGNChannel** supports two calling conventions:
+
+```python
+AWGNChannel(snr_db=15.0)                         # signal-power SNR — link_sim style
+AWGNChannel(ebn0_db=10.0, bits_per_symbol=4)     # Eb/N0 — sim_ber style
+```
+
+**RayleighChannel** — MIMO flat fading, independent complex Gaussian tap per sample, returns `(n_rx, n_tx, n_samples)` channel matrix. Used by `link_sim`.
+
+**FlatRayleighChannel** — single-antenna block-fading, `h ~ CN(0,1)` constant within one OFDM symbol, independent across symbols. `per_sample=True` for fast fading. Eb/N0 convention. Used by `sim_ber`.
+
+**EPAChannel** — Extended Pedestrian A, TS 36.104 Table B.2-1. Seven taps, 410 ns max delay. Jakes Doppler per tap, random angle of arrival. Default 3 km/h pedestrian. Works with μ=0, 1, 2. Too short a CP at μ=3.
+
+**CDLChannel** — CDL-A / CDL-B / CDL-C per TS 38.901 Table 7.7.2. Full multipath with per-path Jakes Doppler, MIMO-capable. CDL-A (11 paths, 750 ns max delay) is the default NR evaluation model. Signal-power SNR convention.
+
+---
+
+## Coding layer
+
+### LDPC (TS 38.212 §5.3–5.4)
+
+Systematic encoder via GF(2) back-substitution. Belief propagation (sum-product) decoder, 50 iterations default. Circular-buffer rate matching with RV sequence 0 → 2 → 3 → 1.
+
+The parity-check matrix is procedurally generated rather than loaded from the 3GPP BG1 lifting tables. Performance is representative but not spec-identical. Swap in the official matrices from TS 38.212 Annex A for exact curves.
+
+### Polar (TS 38.212 §5.3)
+
+Bhattacharyya reliability ordering, CRC-6 attachment, CA-SCL decoder with list size L=8. Reliability sequence computed numerically rather than loaded from TS 38.212 Table 5.3.1.2-1.
+
+### HARQ (TS 38.321 §5.4)
+
+Eight parallel HARQ processes, max four transmissions per TB. IR soft combining accumulates LLRs in a `SoftBuffer` across retransmissions. `HARQManager` handles process scheduling and feeds ACK/NACK back to `OLLAController`.
+
+---
+
+## PHY layer
+
+### OFDM
+
+DC-centred subcarrier mapping, guard-band zeroing, power-of-2 FFT size enforced. Modulation and demodulation live on a single `OFDMModulator` object — TX and RX share the same `symbol_len`, `cp_len`, and subcarrier indices so there's no risk of a length mismatch at the demodulator.
+
+DMRS pilots are Type-1 comb-2 (every even subcarrier) at symbols 2 and 11. `NRFrameStructure` provides a slot map, data symbol indices, mini-slot lengths (2/4/7 symbols), and a `print_slot_map()` helper.
+
+### Equalisation
+
+| Detector | Method | Notes |
+|---|---|---|
+| ZF | `W = (H^H H)^{-1} H^H` | Noise-enhancing at low SNR |
+| MMSE | `W = (H^H H + σ²I)^{-1} H^H` | Default. Good SNR/interference balance |
+| SIC | MMSE + hard cancellation | V-BLAST order, strongest layer first |
+
+### Channel estimation
+
+**LSEstimator** — `H_ls[k] = Y[k] / X[k]` at pilots, linear interpolation to data subcarriers.
+
+**LMMSEEstimator** — `H = R_hh (R_hh + σ²I)^{-1} H_ls` with exponential correlation model. More robust at low SNR and large pilot spacing.
+
+### Modulation
+
+Gray-coded QPSK / 16-QAM / 64-QAM. LLR computation uses Max-Log-MAP: for each bit position, the difference between the minimum distance to constellation points labelled 0 and 1, normalised by noise variance.
+
+### MIMO
+
+Kronecker spatial correlation model for channel generation. DFT-based Type-I single-panel precoding codebook. `RISelector` SVD rank selection with minimum per-layer SINR constraint. `CQIComputer` EESM effective SINR across subcarriers.
+
+---
+
+## MAC layer
+
+**LinkAdaptor** maps CQI to MCS via TS 38.214 efficiency table, offset by an OLLA-driven SNR correction.
+
+**OLLAController** step-up/step-down targeting 10% BLER:
+- NACK → +1.0 dB
+- ACK  → −0.1 dB
+- Clamped to ±10 dB
+
+---
+
+## BER validation
+
+`sim/sim_ber.py` sweeps Eb/N0 for BPSK, QPSK, 16-QAM, 64-QAM, 256-QAM over AWGN and flat Rayleigh, comparing simulated curves against analytical expressions. Four plots saved to `output/`.
+
+Verified deviations from theory (AWGN, 50 000 symbols):
+
+| Modulation | Eb/N0 | Simulated | Theory | Δ |
+|---|---|---|---|---|
+| QPSK | 5 dB | 6.11 × 10⁻³ | 5.95 × 10⁻³ | 0.11 dB ✓ |
+| QPSK | 8 dB | 2.00 × 10⁻⁴ | 1.91 × 10⁻⁴ | 0.21 dB ✓ |
+| 16-QAM | 5 dB | 4.20 × 10⁻² | 4.19 × 10⁻² | 0.02 dB ✓ |
+| 16-QAM | 8 dB | 9.13 × 10⁻³ | 9.25 × 10⁻³ | 0.06 dB ✓ |
+
+### Plots
+
+| File | Contents |
+|---|---|
+| `ber_compare.png` | Simulated vs theoretical BER, BPSK–256QAM, AWGN + Rayleigh |
+| `frame_structure.png` | NR resource grid, DMRS positions, PRB boundaries, slot timeline |
+| `cp_analysis.png` | CP duration vs numerology, overlaid with EPA/EVA/ETU delay spread limits |
+| `mcs_comparison.png` | BER waterfall per MCS group, QPSK/16-QAM/64-QAM |
+
+---
+
+## Known limitations
+
+**BP decoder is slow** — Pure Python sum-product is the main runtime bottleneck for large block sizes. A Cython extension or vectorised min-sum approximation would help significantly.
+
+**LDPC matrix is approximate** — Procedurally generated, not the official 3GPP BG1/BG2 lifted graph. Load the spec matrices from TS 38.212 Annex A for exact performance.
+
+**SIC uses hard decisions** — The V-BLAST cancellation step hard-decides with a QPSK slicer regardless of the actual modulation. This degrades SIC performance at higher MCS compared to proper soft cancellation.
+
+**Linear channel estimator interpolation** — Fine for EPA and CDL-A but degrades for CDL-C (750 ns delay, dense multipath). A DFT-based interpolator handles higher delay spread better.
+
+**One data symbol per slot** — `link_sim` modulates a single OFDM symbol per slot for speed. A full 14-symbol slot with proper DMRS/data multiplexing would give more accurate throughput numbers and realistic HARQ timing.
+
+---
+
+## 3GPP references
+
+| Spec | Subject |
+|---|---|
+| TS 38.211 | Physical channels and modulation |
+| TS 38.212 | Multiplexing and channel coding |
+| TS 38.214 | Physical layer procedures for data |
+| TS 38.321 | MAC protocol |
+| TS 38.901 | Channel models (0.5–100 GHz) |
+| TS 36.104 | Base station radio transmission (EPA profile) |
+
+---
+
+## License
+
+MIT. Do whatever you want with it.
