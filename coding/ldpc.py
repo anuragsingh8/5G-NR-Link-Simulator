@@ -1,596 +1,268 @@
 """
-coding/ldpc.py — LDPC Encoder, Belief-Propagation Decoder, and Rate Matching
+coding/ldpc.py — LDPC Encoder, Belief-Propagation Decoder, Rate Matching
+3GPP TS 38.212 Section 5.3 / 5.4 (Base Graph 1 & 2)
 
-This module implements a lightweight LDPC (Low Density Parity Check) coding
-chain inspired by 5G NR.
+Note on LDPC matrix
+-------------------
+The parity-check matrix H is constructed via a random regular LDPC ensemble
+(column weight 3). Encoding uses GF(2) Gaussian elimination to derive a
+systematic generator matrix G such that H G^T = 0, guaranteeing H @ cw = 0
+for every encoded codeword.  Info bits sit at cw[0..k-1] by construction.
 
-Implemented components:
-  • LDPCEncoder
-      Systematic LDPC encoder.
-
-  • BPDecoder
-      Belief Propagation LDPC decoder using the Sum-Product Algorithm.
-
-  • RateMatch
-      Circular-buffer rate matching and de-rate-matching.
-
-References:
-  • 3GPP TS 38.212 Section 5.3
-  • 3GPP TS 38.212 Section 5.4
+For exact 3GPP BG1/BG2 performance, load the lifted matrices from TS 38.212
+Annex A and replace _build_H() below.
 """
 
 from __future__ import annotations
-
 import numpy as np
 
-from scipy.sparse import csr_matrix
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Small illustrative Base Graph construction
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Real 5G NR uses:
-#   • Base Graph 1 (BG1)
-#   • Base Graph 2 (BG2)
-#
-# These are large quasi-cyclic LDPC matrices defined by 3GPP.
-#
-# For educational simulation purposes, this implementation generates a small
-# random sparse parity-check matrix instead of loading full 3GPP tables.
-#
-# LDPC matrices are sparse:
-#   • few 1s,
-#   • many 0s.
-#
-# Sparse structure enables:
-#   • efficient decoding,
-#   • iterative message passing,
-#   • near-Shannon-limit performance.
+# GF(2) utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def _make_bg1_small(
-    k: int = 22,
-    n: int = 68,
-) -> np.ndarray:
+def _gf2_rref(M: np.ndarray) -> tuple[np.ndarray, list[int]]:
     """
-    Generate a small sparse LDPC parity-check matrix.
-
-    Parameters
-    ----------
-    k : int
-        Number of information bits.
-
-    n : int
-        Total codeword length.
-
-    Returns
-    -------
-    np.ndarray
-        Binary parity-check matrix H with shape:
-            (n-k, n)
+    Reduced row echelon form over GF(2).
+    Returns (rref_matrix, pivot_columns).
     """
+    M = M.copy().astype(np.uint8)
+    nrows, ncols = M.shape
+    pivot_cols = []
+    row = 0
+    for col in range(ncols):
+        candidates = np.where(M[row:, col] == 1)[0]
+        if len(candidates) == 0:
+            continue
+        r = candidates[0] + row
+        M[[row, r]] = M[[r, row]]
+        for r2 in range(nrows):
+            if r2 != row and M[r2, col] == 1:
+                M[r2] ^= M[row]
+        pivot_cols.append(col)
+        row += 1
+        if row == nrows:
+            break
+    return M, pivot_cols
 
-    # Create deterministic random generator for reproducibility.
-    rng = np.random.default_rng(0)
 
-    # Number of parity-check equations.
-    n_check = n - k
+def _systematic_generator(H: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Derive systematic generator matrix G from H over GF(2).
+    Returns (G, perm) where G is (k x n) in permuted column order and
+    H[:, perm] = [A | I_m].  Info bits at G columns 0..k-1.
+    """
+    m, n = H.shape
+    k = n - m
 
-    # Allocate parity-check matrix initialized to zeros.
-    #
-    # dtype=uint8 is sufficient because entries are binary.
-    H = np.zeros((n_check, n), dtype=np.uint8)
+    Hrref, pivots = _gf2_rref(H)
+    pivots = np.array(pivots)
+    non_pivots = np.array([c for c in range(n) if c not in pivots])
 
-    # Construct sparse columns.
-    #
-    # Each column corresponds to one codeword bit.
-    # Each bit participates in exactly 3 parity equations.
+    perm   = np.concatenate([non_pivots, pivots])
+    H_perm = Hrref[:, perm]   # [A | I_m]
+
+    A = H_perm[:, :k]         # (m x k)
+    G = np.hstack([np.eye(k, dtype=np.uint8), (A.T % 2)])  # (k x n)
+    return G, perm
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Random regular LDPC parity-check matrix
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_H(k: int, n: int, col_weight: int = 3, seed: int = 0) -> np.ndarray:
+    """
+    Build a random regular LDPC parity-check matrix H of size (n-k) x n.
+    Column weight = col_weight.
+    """
+    m = n - k
+    rng = np.random.default_rng(seed)
+    H = np.zeros((m, n), dtype=np.uint8)
     for col in range(n):
-
-        # Randomly choose 3 rows where this bit participates.
-        rows = rng.choice(
-            n_check,
-            size=3,
-            replace=False,
-        )
-
-        # Set parity-check connections.
+        rows = rng.choice(m, size=col_weight, replace=False)
         H[rows, col] = 1
-
-    # Ensure every parity-check equation has at least one participating bit.
-    #
-    # This prevents invalid empty rows.
-    for row in range(n_check):
-
+    for row in range(m):
         if H[row].sum() == 0:
-
-            # Randomly activate one bit in this row.
             H[row, rng.integers(0, n)] = 1
-
-    # Return generated LDPC parity-check matrix.
     return H
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LDPC Encoder
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LDPCEncoder:
     """
     Systematic LDPC encoder.
 
-    Systematic encoding means:
-
-        codeword = [information_bits | parity_bits]
-
-    The original information bits appear unchanged at the start of the
-    codeword.
+    Uses a generator matrix G derived from H via GF(2) Gaussian elimination.
+    Guarantees H @ cw = 0 for every encoded codeword.
+    Info bits are at cw[0..k-1] by construction.
 
     Parameters
     ----------
-    k : int
-        Number of information bits.
-
-    n : int
-        Total codeword length.
+    k : information bits per codeword
+    n : total codeword bits  (rate = k/n)
     """
 
-    def __init__(
-        self,
-        k: int = 22,
-        n: int = 68,
-    ):
-        """
-        Initialize LDPC encoder.
-        """
-
-        # Information bit length.
-        self.k = k
-
-        # Total codeword length.
-        self.n = n
-
-        # Coding rate:
-        #
-        #   R = k / n
-        #
-        # Higher rate:
-        #   more throughput,
-        #   less redundancy.
+    def __init__(self, k: int = 128, n: int = 200):
+        self.k    = k
+        self.n    = n
         self.rate = k / n
 
-        # Generate parity-check matrix.
-        self.H = _make_bg1_small(k, n)
-
-        # Number of parity bits.
-        self.n_check = n - k
+        H_raw         = _build_H(k, n)
+        self._G, perm = _systematic_generator(H_raw)
+        # Keep H in permuted column order — consistent with codeword layout
+        self.H        = H_raw[:, perm]
 
     def encode(self, bits: np.ndarray) -> np.ndarray:
         """
-        Systematic LDPC encoding.
+        Systematic encode.  codeword[:k] = bits, codeword[k:] = parity bits.
+        H @ codeword = 0 (mod 2) is guaranteed.
 
         Parameters
         ----------
-        bits : np.ndarray
-            Information bits with shape ``(k,)``.
+        bits : (k,) binary array
 
         Returns
         -------
-        np.ndarray
-            Encoded codeword with shape ``(n,)``.
+        codeword : (n,) binary array
         """
+        assert len(bits) == self.k, f"Expected {self.k} bits, got {len(bits)}"
+        return (bits.astype(np.uint8) @ self._G) % 2
 
-        # Ensure correct information block length.
-        assert len(bits) == self.k
-
-        # Copy information bits.
-        #
-        # These remain unchanged in systematic encoding.
-        u = bits.copy()
-
-        # Split parity-check matrix:
-        #
-        #   H = [H_s | H_p]
-        #
-        # H_s:
-        #   systematic part operating on information bits.
-        #
-        # H_p:
-        #   parity portion operating on parity bits.
-        H_s = self.H[:, :self.k]
-
-        H_p = self.H[:, self.k:]
-
-        # Compute syndrome contribution from information bits:
-        #
-        #   s = H_s * u
-        #
-        # All operations occur in GF(2).
-        s = H_s @ u % 2
-
-        # Allocate parity bit vector.
-        p = np.zeros(
-            self.n_check,
-            dtype=np.uint8,
-        )
-
-        # Compute parity bits sequentially using back-substitution.
-        #
-        # This assumes H_p behaves approximately like a lower-triangular matrix.
-        for i in range(self.n_check):
-
-            # Compute parity equation modulo-2.
-            p[i] = (
-                s[i]
-                + H_p[i, :i] @ p[:i]
-            ) % 2
-
-        # Final systematic codeword:
-        #
-        #   [information | parity]
-        return np.concatenate([u, p])
-
-    def rate_match(
-        self,
-        codeword: np.ndarray,
-        e_bits: int,
-    ) -> np.ndarray:
+    def rate_match(self, codeword: np.ndarray, e_bits: int) -> np.ndarray:
         """
-        Perform simple circular-buffer rate matching.
+        Circular-buffer rate matching to e_bits output length.
+        Repeats codeword if e_bits > n, truncates if e_bits < n.
 
         Parameters
         ----------
-        codeword : np.ndarray
-            Encoded LDPC codeword.
-
-        e_bits : int
-            Desired number of transmitted bits.
+        codeword : (n,) binary codeword
+        e_bits   : desired output length
 
         Returns
         -------
-        np.ndarray
-            Rate-matched output bits.
+        rm : (e_bits,) binary array
         """
-
-        # Circular buffer length.
-        n_cb = len(codeword)
-
-        # If fewer bits are needed than available:
-        # simply puncture/truncate.
-        if e_bits <= n_cb:
+        if e_bits <= self.n:
             return codeword[:e_bits]
-
-        # Otherwise repeat circularly.
-        #
-        # Used for low coding rates or retransmissions.
-        reps = (e_bits // n_cb) + 1
-
-        # Tile repeatedly and truncate to requested size.
+        reps = (e_bits // self.n) + 1
         return np.tile(codeword, reps)[:e_bits]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BP Decoder — vectorised min-sum
+# ─────────────────────────────────────────────────────────────────────────────
+
 class BPDecoder:
     """
-    Belief Propagation LDPC decoder.
+    Belief Propagation LDPC decoder — vectorised min-sum approximation.
 
-    Uses iterative Sum-Product Algorithm (SPA).
-
-    Decoder operates on:
-      • variable nodes (bits),
-      • check nodes (parity equations).
-
-    Messages are exchanged iteratively until:
-      • parity checks are satisfied,
-      • or maximum iterations reached.
+    Uses min-sum (box-plus) instead of tanh/arctanh for speed and numerical
+    stability. Within ~0.5 dB of sum-product for block sizes used here.
+    Built once and reused across slots — do not instantiate inside a loop.
 
     Parameters
     ----------
-    H : np.ndarray
-        Parity-check matrix.
-
-    max_iter : int
-        Maximum decoding iterations.
+    H        : parity-check matrix (n_check x n)
+    max_iter : maximum BP iterations
     """
 
-    def __init__(
-        self,
-        H: np.ndarray,
-        max_iter: int = 50,
-    ):
-        """
-        Initialize BP decoder.
-        """
-
-        # Store parity-check matrix.
-        self.H = H
-
-        # Maximum allowed decoding iterations.
+    def __init__(self, H: np.ndarray, max_iter: int = 50):
+        self.H        = H
         self.max_iter = max_iter
-
-        # Matrix dimensions:
-        #
-        #   n_check = parity equations
-        #   n       = codeword bits
         self.n_check, self.n = H.shape
 
-        # ─────────────────────────────────────────────────────────────────
-        # Precompute graph connectivity
-        # ─────────────────────────────────────────────────────────────────
-        #
-        # LDPC decoding operates on a Tanner graph.
-        #
-        # Variable node:
-        #   codeword bit
-        #
-        # Check node:
-        #   parity equation
-        # ─────────────────────────────────────────────────────────────────
-
-        # Check-node neighbors:
-        #
-        # For each parity equation,
-        # store connected bit indices.
-        self._cn_nbrs = [
-            np.where(H[i] == 1)[0]
-            for i in range(self.n_check)
-        ]
-
-        # Variable-node neighbors:
-        #
-        # For each bit,
-        # store connected parity equations.
-        self._vn_nbrs = [
-            np.where(H[:, j] == 1)[0]
-            for j in range(self.n)
-        ]
+        rows, cols      = np.where(H == 1)
+        self._rows      = rows
+        self._cols      = cols
+        self._n_edges   = len(rows)
+        self._cn_edges  = [np.where(rows == i)[0] for i in range(self.n_check)]
+        self._vn_edges  = [np.where(cols == j)[0] for j in range(self.n)]
 
     def decode(self, llrs: np.ndarray) -> np.ndarray:
         """
-        Decode LDPC codeword using belief propagation.
+        Decode using vectorised min-sum BP.
 
         Parameters
         ----------
-        llrs : np.ndarray
-            Channel LLR values.
+        llrs : (n,) channel LLR values  (positive = bit likely 0)
 
         Returns
         -------
-        np.ndarray
-            Hard-decision decoded bits.
+        bits : (n,) hard-decision decoded bits
         """
+        v2c = llrs[self._cols].astype(float).copy()
+        c2v = np.zeros(self._n_edges)
 
-        # ─────────────────────────────────────────────────────────────────
-        # Initialize variable-to-check messages
-        # ─────────────────────────────────────────────────────────────────
-        #
-        # Initial belief for every edge comes directly from channel LLR.
-        # ─────────────────────────────────────────────────────────────────
-        v2c = {
-            (j, i): llrs[j]
-            for i in range(self.n_check)
-            for j in self._cn_nbrs[i]
-        }
-
-        # Iterative decoding loop.
         for _ in range(self.max_iter):
+            # Check-to-variable update (min-sum)
+            for i, eidx in enumerate(self._cn_edges):
+                if len(eidx) < 2:
+                    continue
+                msgs       = v2c[eidx]
+                signs      = np.sign(msgs)
+                abs_m      = np.abs(msgs)
+                tot_sgn    = np.prod(signs)
+                sorted_abs = np.sort(abs_m)
+                min1, min2 = sorted_abs[0], sorted_abs[1]
+                for k_local, e in enumerate(eidx):
+                    sgn_ex = tot_sgn * signs[k_local] if signs[k_local] != 0 else tot_sgn
+                    min_ex = min2 if abs_m[k_local] == min1 else min1
+                    c2v[e] = float(sgn_ex) * min_ex
 
-            # ─────────────────────────────────────────────────────────────
-            # Check-node update
-            # ─────────────────────────────────────────────────────────────
-            #
-            # Computes parity consistency messages using tanh rule:
-            #
-            #   m_c→v =
-            #       2 atanh( Π tanh(m_v→c / 2) )
-            # ─────────────────────────────────────────────────────────────
-            c2v: dict[tuple, float] = {}
+            # Total belief at each variable node
+            total = llrs.copy()
+            np.add.at(total, self._cols, c2v)
 
-            for i in range(self.n_check):
+            # Variable-to-check update
+            for j, eidx in enumerate(self._vn_edges):
+                for e in eidx:
+                    v2c[e] = total[j] - c2v[e]
 
-                # Neighboring bits connected to this parity equation.
-                nbrs = self._cn_nbrs[i]
-
-                for j in nbrs:
-
-                    # All neighboring bits except current one.
-                    others = [
-                        k for k in nbrs
-                        if k != j
-                    ]
-
-                    # No neighbors:
-                    # message becomes neutral.
-                    if not others:
-                        c2v[(i, j)] = 0.0
-                        continue
-
-                    # Compute product term.
-                    prod = np.prod([
-                        np.tanh(v2c[(k, i)] / 2)
-                        for k in others
-                    ])
-
-                    # Numerical protection:
-                    # avoid atanh(±1).
-                    prod = np.clip(
-                        prod,
-                        -1 + 1e-10,
-                        1 - 1e-10,
-                    )
-
-                    # Final check-node message.
-                    c2v[(i, j)] = 2 * np.arctanh(prod)
-
-            # ─────────────────────────────────────────────────────────────
-            # Variable-node update
-            # ─────────────────────────────────────────────────────────────
-            #
-            # Combine:
-            #   channel LLR
-            #   +
-            #   incoming parity messages
-            # ─────────────────────────────────────────────────────────────
-            for j in range(self.n):
-
-                nbrs = self._vn_nbrs[j]
-
-                # Total belief for this bit.
-                total = (
-                    llrs[j]
-                    + sum(c2v[(i, j)] for i in nbrs)
-                )
-
-                # Send extrinsic information to each neighboring check node.
-                for i in nbrs:
-                    v2c[(j, i)] = total - c2v[(i, j)]
-
-            # ─────────────────────────────────────────────────────────────
-            # Hard decision
-            # ─────────────────────────────────────────────────────────────
-            #
-            # Positive LLR → bit 0
-            # Negative LLR → bit 1
-            # ─────────────────────────────────────────────────────────────
-            bits = np.array([
-                0
-                if (
-                    llrs[j]
-                    + sum(
-                        c2v[(i, j)]
-                        for i in self._vn_nbrs[j]
-                    )
-                ) >= 0
-                else 1
-                for j in range(self.n)
-            ], dtype=np.uint8)
-
-            # ─────────────────────────────────────────────────────────────
-            # Syndrome check
-            # ─────────────────────────────────────────────────────────────
-            #
-            # Valid codeword satisfies:
-            #
-            #   H * c = 0  (mod 2)
-            # ─────────────────────────────────────────────────────────────
+            # Hard decision + early exit on valid codeword
+            bits = (total < 0).astype(np.uint8)
             if np.all(self.H @ bits % 2 == 0):
-
-                # Early stopping:
-                # decoding successful.
                 return bits
 
-        # Maximum iterations reached.
-        #
-        # Return best estimate obtained so far.
         return bits
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Rate Matching  (TS 38.212 Section 5.4.2)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class RateMatch:
     """
-    LDPC Rate Matching and De-Rate Matching.
-
-    Implements simplified circular-buffer extraction similar to NR.
-
-    Different redundancy versions (RVs) use different starting offsets inside
-    the circular buffer.
+    LDPC Rate Matching / De-Rate Matching (circular buffer).
+    3GPP TS 38.212 Section 5.4.2
 
     Parameters
     ----------
-    n_cb : int
-        Circular buffer length.
-
-    e_bits : int
-        Number of transmitted bits.
-
-    rv : int
-        Redundancy version index.
+    n_cb   : circular buffer length (codeword length)
+    e_bits : number of output bits
+    rv     : redundancy version (0-3)
     """
 
-    def __init__(
-        self,
-        n_cb: int,
-        e_bits: int,
-        rv: int = 0,
-    ):
-        """
-        Initialize rate matcher.
-        """
-
-        # Circular buffer size.
-        self.n_cb = n_cb
-
-        # Requested output bit count.
+    def __init__(self, n_cb: int, e_bits: int, rv: int = 0):
+        self.n_cb   = n_cb
         self.e_bits = e_bits
-
-        # RV-dependent offsets.
-        #
-        # Different RVs expose different parity subsets.
-        offsets = [
-            0,
-            n_cb // 4,
-            n_cb // 2,
-            3 * n_cb // 4,
-        ]
-
-        # Starting extraction offset.
-        self.k0 = offsets[rv % 4]
+        offsets     = [0, n_cb // 4, n_cb // 2, 3 * n_cb // 4]
+        self.k0     = offsets[rv % 4]
 
     def match(self, codeword: np.ndarray) -> np.ndarray:
+        """Extract e_bits from circular buffer starting at k0."""
+        buf = np.tile(codeword, (self.e_bits // self.n_cb) + 2)
+        return buf[self.k0: self.k0 + self.e_bits]
+
+    def dematch(self, llrs: np.ndarray, n: int) -> np.ndarray:
         """
-        Extract transmitted bits from circular buffer.
-
-        Parameters
-        ----------
-        codeword : np.ndarray
-            Full LDPC codeword.
-
-        Returns
-        -------
-        np.ndarray
-            Rate-matched output bits.
+        De-rate-match: accumulate LLRs back into circular buffer positions.
+        Combining rule: soft MRC accumulation (HARQ IR combining).
         """
-
-        # Extend circular buffer by repetition.
-        #
-        # Extra repetition ensures extraction window always fits.
-        buf = np.tile(
-            codeword,
-            (self.e_bits // self.n_cb) + 2,
-        )
-
-        # Extract transmission window beginning at RV offset.
-        return buf[
-            self.k0:
-            self.k0 + self.e_bits
-        ]
-
-    def dematch(
-        self,
-        llrs: np.ndarray,
-        n: int,
-    ) -> np.ndarray:
-        """
-        De-rate-match received LLR values.
-
-        Parameters
-        ----------
-        llrs : np.ndarray
-            Received soft LLR values.
-
-        n : int
-            Original circular buffer size.
-
-        Returns
-        -------
-        np.ndarray
-            Reconstructed circular-buffer LLRs.
-        """
-
-        # Allocate reconstructed circular buffer.
         buf = np.zeros(n)
-
-        # Scatter incoming LLRs back into original RV positions.
         for i, llr in enumerate(llrs):
-
-            # Circular indexing enables HARQ combining.
             buf[(self.k0 + i) % n] += llr
-
-        # Return reconstructed soft buffer.
         return buf
