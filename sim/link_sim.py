@@ -13,7 +13,7 @@ from typing import Optional
 
 from config.sim_config   import SimConfig
 from config.nr_tables    import get_mcs_params, get_tbs
-from phy.ofdm            import OFDMModulator, OFDMDemodulator
+from phy.ofdm            import OFDMModulator, NR_NUMEROLOGIES
 from phy.channel         import AWGNChannel, RayleighChannel, CDLChannel
 from phy.channel_est     import LSEstimator, LMMSEEstimator
 from phy.equaliser       import ZFEqualiser, MMSEEqualiser, SICEqualiser
@@ -63,7 +63,7 @@ class LinkSimulator:
 
         # ── TX ────────────────────────────────────────────────────────────────
         self.mapper    = Mapper(self.Qm)
-        self.modulator = OFDMModulator(cfg.n_fft, cfg.cp_len, cfg.n_subcarriers)
+        self.modulator = OFDMModulator(mu=cfg.numerology, n_fft=cfg.n_fft, n_prb=cfg.n_prb, cp_len=cfg.cp_len)
         self.encoder   = LDPCEncoder(k=min(self.tbs, 100), n=min(self.tbs + 50, 200))
 
         # ── Channel ───────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ class LinkSimulator:
         self._is_awgn = cfg.channel_model == 'AWGN'
 
         # ── RX ────────────────────────────────────────────────────────────────
-        self.demodulator  = OFDMDemodulator(cfg.n_fft, cfg.cp_len, cfg.n_subcarriers)
+        self.demodulator  = self.modulator   # same object — demodulate() lives on OFDMModulator
         self.ch_estimator = LMMSEEstimator(cfg.n_subcarriers, cfg.snr_db)
         det_map = {'ZF': ZFEqualiser, 'MMSE': MMSEEqualiser, 'SIC': SICEqualiser}
         DetCls = det_map.get(cfg.detector, MMSEEqualiser)
@@ -120,17 +120,7 @@ class LinkSimulator:
 
     def _rx_chain(self, rx_time: np.ndarray) -> tuple[np.ndarray, bool]:
         """time-domain RX → decoded bits + CRC pass/fail (simplified)."""
-        if rx_time.ndim == 1:
-            rx_sym = self.demodulator.demodulate(rx_time)
-        else:
-            rx_sym = np.stack([
-                self.demodulator.demodulate(rx_time[rx])
-                for rx in range(rx_time.shape[0])
-            ], axis=0)
-        
-        # Convert multi-RX output to single stream for current estimator
-        if rx_sym.ndim == 2:
-            rx_sym = rx_sym[0]
+        rx_sym = self.demodulator.demodulate(rx_time)
 
         # Channel estimation (use received signal as pilot proxy for AWGN sim)
         H_est = self.ch_estimator.estimate(rx_sym)
@@ -182,11 +172,12 @@ class LinkSimulator:
                 rx_time, _ = self.channel.apply(tx_time[np.newaxis, :])
                 rx_time = rx_time.squeeze()
 
-            # Ensure correct length for demodulator
-            sym_len = self.modulator.symbol_len
-            rx_time = rx_time[:sym_len]
+            # Trim to exactly one OFDM symbol (TX produced exactly symbol_len samples)
+            sym_len  = self.modulator.symbol_len
+            rx_time  = rx_time.ravel()[:sym_len]
             if len(rx_time) < sym_len:
                 rx_time = np.pad(rx_time, (0, sym_len - len(rx_time)))
+            assert len(rx_time) == sym_len,                 f"rx_time length {len(rx_time)} != symbol_len {sym_len}"
 
             # ── RX chain ─────────────────────────────────────────────────
             dec_bits, crc_ok = self._rx_chain(rx_time)
