@@ -148,11 +148,10 @@ def get_tbs(mcs_idx: int, n_prb: int, n_symb: int = 12, n_layers: int = 1) -> in
     TBS in bits
     """
     # Step 1: Validate MCS index. The code checks whether the requested MCS index exists in MCS_TABLE. 
-    # If not, it raises an error.
+    # If not, it raises an error.	
     if mcs_idx not in MCS_TABLE:
         raise ValueError(f"MCS index {mcs_idx} out of range (0-28)")
-    
-    # Step 2: Read MCS parameters. 
+	# Step 2: Read MCS parameters. 
     #       Each MCS entry contains something like:(Qm, R_x1024, spectral_efficiency)
     #           1. qm: Modulation order. This is the number of bits per modulation symbol.       
     #               | Qm | Modulation |
@@ -162,6 +161,7 @@ def get_tbs(mcs_idx: int, n_prb: int, n_symb: int = 12, n_layers: int = 1) -> in
     #               |  8 | 256QAM     |
     #           2. r_x1024: Code rate scaled by 1024. Example : if r_x1024 = 490 then actual code "490 / 1024 = 0.4785"
     #           3. The underscore _ means the spectral efficiency value is ignored in this function.
+
     qm, r_x1024, _ = MCS_TABLE[mcs_idx]
     # Step 3: Calculate number of REs
     # Lets understand PRB using a real world analogy:
@@ -170,9 +170,9 @@ def get_tbs(mcs_idx: int, n_prb: int, n_symb: int = 12, n_layers: int = 1) -> in
     # total PRB bandwidth changes.
     # For example if Each PRB has 12 subcarriers. So if n_symb = 12. n_re_per_prb = 12 * 12 = 144. 
     # That means each PRB has 144 usable resource elements before the cap.
-    
-    n_re_per_prb = 12 * n_symb                   # REs per PRB (12 SCs × symbols)
-    
+	
+    n_re_per_prb = 12 * n_symb # REs per PRB (12 SCs × symbols)
+
     # As per 3gpp 38.214 for TBS calculation methodology 156 is a standardized upper bound approximation used in 
     # TBS determination, not the exact real RE count in every slot. “Per PRB, never assume more than 156 usable REs 
     # for TBS calculation.” even when total number of REs exits per slot "12*14=168" where Normal CP slot: 
@@ -183,9 +183,9 @@ def get_tbs(mcs_idx: int, n_prb: int, n_symb: int = 12, n_layers: int = 1) -> in
     # puncturing, CSI-RS, CORESET overlap, DSS coexistence, So NR standardized a simplified method.
     # n_prb = 52, n_symb = 12. n_re_per_prb = 144, n_re = min(156, 144) * 52, n_re = 144 * 52, n_re = 7488. 
     # So the allocation contains 7488 usable REs.
+    n_re = min(156, n_re_per_prb) * n_prb # cap at 156 RE/PRB (overhead)
+    n_info = n_re * (r_x1024 / 1024) * qm * n_layers
     
-    n_re = min(156, n_re_per_prb) * n_prb        # cap at 156 RE/PRB (overhead)
-
     # Step 4: Compute raw information bits. This estimates the number of information bits before final TBS rounding.
     # n_info = number_of_REs × code_rate × modulation_order × layers
     # This estimates the number of information bits before final TBS rounding.
@@ -316,32 +316,29 @@ def get_tbs(mcs_idx: int, n_prb: int, n_symb: int = 12, n_layers: int = 1) -> in
 # means:
 # “Take all usable resource elements, multiply by how many bits each symbol carries, adjust for coding redundancy, and scale by number of parallel streams to estimate how many real payload bits can be transmitted.”
 # It is the core throughput equation of the physical layer.
-
-    n_info = n_re * (r_x1024 / 1024) * qm * n_layers
-    # For small transport blocks, the standard uses a table/quantisation process.
+    
     if n_info <= 3824:
-        # This rounds n_info to a suitable intermediate value called n_info_prime. 
-        # The max(24, ...) ensures the result is never below 24 bits. 
-        # The result is rounded up to one of the allowed TBS table values.
-        # Important note: this code assumes n_info > 24. If n_info <= 24, then: math.log2(n_info - 24)
-        # would fail because the logarithm of zero or a negative number is invalid. 
-        # A safer implementation would handle that case explicitly.
-        n_info_prime = max(24, 2 ** math.floor(math.log2(n_info - 24)) * round((n_info - 24) / 2 ** math.floor(math.log2(n_info - 24))))
+        # TS 38.214 §5.1.3.2 step 3a: n = floor(log2(N_info - 24)) - 1
+        n            = max(0, math.floor(math.log2(n_info - 24)) - 1)
+        n_info_prime = max(24, 2**n * round((n_info - 24) / 2**n))
         return _quantise_tbs(n_info_prime)
     else:
         # For larger transport blocks, the code uses a formula instead of the small TBS quantisation table.
         # This rounds n_info upward to a power-of-two-based boundary. The result is at least 3840. 
-        n_info_prime = max(3840, 2 ** math.floor(math.log2(n_info - 24)) * math.ceil((n_info - 24) / 2 ** math.floor(math.log2(n_info - 24))))
-        # Then the code checks the code rate: 
+        # TS 38.214 §5.1.3.2 step 3b: n = floor(log2(N_info - 24))  [no -1]
+        n            = math.floor(math.log2(n_info - 24))
+        n_info_prime = max(3840, 2**n * math.ceil((n_info - 24) / 2**n))
+                # Then the code checks the code rate: 
         # Here c is the number of code blocks after segmentation. Low-rate blocks use a smaller threshold, 3816. 
         # Higher-rate blocks use 8424.
         # This rounds the final TBS to a multiple of 8 * c, then subtracts 24 CRC bits.
+	
         if (r_x1024 / 1024) <= 0.25:
-            # For low code rates, it uses:
+			# For low code rates, it uses:
             c = math.ceil((n_info_prime + 24) / 3816)
             tbs = 8 * c * math.ceil((n_info_prime + 24) / (8 * c)) - 24
         else:
-            # For higher code rates, it uses:
+		    # For higher code rates, it uses:
             c = math.ceil((n_info_prime + 24) / 8424)
             tbs = 8 * c * math.ceil((n_info_prime + 24) / (8 * c)) - 24
         return int(tbs)
@@ -365,6 +362,7 @@ def get_tbs(mcs_idx: int, n_prb: int, n_symb: int = 12, n_layers: int = 1) -> in
 #   For Qm = 8, this becomes: 256-QAM
 #   But for Qm = 10, it would become: 1024-QAM 
 #   also mathematically consistent. The function returns a dictionary:
+
 def get_mcs_params(mcs_idx: int) -> dict:
     """Return modulation order, code rate, and spectral efficiency for an MCS index."""
     if mcs_idx not in MCS_TABLE:
@@ -392,6 +390,7 @@ def get_mcs_params(mcs_idx: int) -> dict:
 #   'modulation': '16QAM',
 #   'code_rate': 0.6016,
 #   'efficiency': 2.4063}
+
 def get_cqi_params(cqi_idx: int) -> dict:
     """Return modulation, code rate, and efficiency for a CQI index (1-15)."""
     if cqi_idx not in CQI_TABLE:
@@ -409,6 +408,7 @@ def get_cqi_params(cqi_idx: int) -> dict:
 # This searches all MCS indices and finds the one whose spectral efficiency is closest to the CQI efficiency.
 # For example, if CQI 9 has efficiency 2.4063, the function finds the MCS whose spectral efficiency is closest to 2.4063.
 # This is a heuristic, not necessarily a strict standards-defined mapping.
+
 def mcs_from_cqi(cqi_idx: int) -> int:
     """
     Map CQI index to a suggested MCS index.
