@@ -93,9 +93,11 @@ def print_result(r: SimResult):
     print(f"  BER            : {r.ber:.3e}")
     print(f"  BLER           : {r.bler:.4f}")
     print(f"  Throughput     : {r.throughput:.3f} Mbps")
+    print(f"  Peak throughput: {r.peak_tput:.3f} Mbps  (BLER=0)")
+    print(f"  Efficiency     : {r.throughput/r.peak_tput*100:.1f}%  of peak")
     print(f"  Avg MCS        : {r.avg_mcs:.1f}")
     print(f"  Slots simulated: {r.n_slots}")
-    print(f"  Total HARQ Tx  : {r.n_harq_tx}")
+    print(f"  Total HARQ Tx  : {r.n_harq_tx}  (retx={r.n_harq_retx})")
     print(f"{'─'*55}")
 
 
@@ -174,3 +176,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+    

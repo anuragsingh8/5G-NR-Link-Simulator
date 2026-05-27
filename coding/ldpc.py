@@ -184,7 +184,10 @@ class BPDecoder:
 
     def decode(self, llrs: np.ndarray) -> np.ndarray:
         """
-        Decode using vectorised min-sum BP.
+        Fully vectorised min-sum BP decoder — no Python loops over nodes.
+
+        Check-node update uses lexsort-based min1/min2 computation across all
+        edges simultaneously. Variable-node update uses np.add.at scatter.
 
         Parameters
         ----------
@@ -194,35 +197,50 @@ class BPDecoder:
         -------
         bits : (n,) hard-decision decoded bits
         """
-        v2c = llrs[self._cols].astype(float).copy()
-        c2v = np.zeros(self._n_edges)
+        v2c   = llrs[self._cols].astype(float).copy()
+        c2v   = np.zeros(self._n_edges)
 
         for _ in range(self.max_iter):
-            # Check-to-variable update (min-sum)
-            for i, eidx in enumerate(self._cn_edges):
-                if len(eidx) < 2:
-                    continue
-                msgs       = v2c[eidx]
-                signs      = np.sign(msgs)
-                abs_m      = np.abs(msgs)
-                tot_sgn    = np.prod(signs)
-                sorted_abs = np.sort(abs_m)
-                min1, min2 = sorted_abs[0], sorted_abs[1]
-                for k_local, e in enumerate(eidx):
-                    sgn_ex = tot_sgn * signs[k_local] if signs[k_local] != 0 else tot_sgn
-                    min_ex = min2 if abs_m[k_local] == min1 else min1
-                    c2v[e] = float(sgn_ex) * min_ex
+            # ── Check-node update (vectorised min-sum) ────────────────────────
+            sign_v2c = np.sign(v2c)
+            abs_v2c  = np.abs(v2c)
 
-            # Total belief at each variable node
-            total = llrs.copy()
+            # Per-check-node sign product
+            row_sign = np.ones(self.n_check)
+            np.multiply.at(row_sign, self._rows, sign_v2c)
+
+            # min1 and min2 per check node via lexsort
+            order       = np.lexsort((abs_v2c, self._rows))
+            s_rows      = self._rows[order]
+            s_abs       = abs_v2c[order]
+            _, first    = np.unique(s_rows, return_index=True)
+            min1        = np.full(self.n_check, np.inf)
+            min2        = np.full(self.n_check, np.inf)
+            min1[s_rows[first]] = s_abs[first]
+            # Second minimum: first edge per row that is not the first
+            mask2       = np.ones(self._n_edges, dtype=bool)
+            mask2[first] = False
+            idx2        = np.where(mask2)[0]
+            if idx2.size:
+                _, u2   = np.unique(s_rows[idx2], return_index=True)
+                min2[s_rows[idx2[u2]]] = s_abs[idx2[u2]]
+            # Clamp inf min2 (single-edge nodes) to min1
+            min2 = np.where(np.isfinite(min2), min2, min1)
+
+            # Per-edge exclude-self values
+            sgn_excl = row_sign[self._rows] * sign_v2c
+            sgn_excl = np.where(sgn_excl == 0, 1.0, sgn_excl)
+            min_excl = np.where(abs_v2c == min1[self._rows],
+                                min2[self._rows],
+                                min1[self._rows])
+            c2v = sgn_excl * min_excl
+
+            # ── Variable-node update ──────────────────────────────────────────
+            total = llrs.astype(float).copy()
             np.add.at(total, self._cols, c2v)
+            v2c = total[self._cols] - c2v
 
-            # Variable-to-check update
-            for j, eidx in enumerate(self._vn_edges):
-                for e in eidx:
-                    v2c[e] = total[j] - c2v[e]
-
-            # Hard decision + early exit on valid codeword
+            # ── Hard decision + early exit ────────────────────────────────────
             bits = (total < 0).astype(np.uint8)
             if np.all(self.H @ bits % 2 == 0):
                 return bits
