@@ -51,7 +51,10 @@ class SimResult:
     bler:          float
     throughput:    float
     peak_tput:     float
+    spectral_eff:  float
     avg_mcs:       float
+    channel:       str
+    bw_mhz:        int
     n_slots:       int
     n_harq_tx:     int
     n_harq_retx:   int
@@ -102,16 +105,20 @@ class LinkSimulator:
 
     def _build_chain(self):
         cfg = self.cfg
-        mcs = get_mcs_params(cfg.mcs)
+        mcs = get_mcs_params(cfg.mcs, cfg.mcs_table)
         self.Qm        = mcs['Qm']
         self.code_rate = mcs['code_rate']
-        self.tbs       = get_tbs(cfg.mcs, cfg.n_prb, n_layers=cfg.n_layers)
+        self.tbs       = get_tbs(cfg.mcs, cfg.n_prb_eff,
+                                n_symb=cfg.n_data_symbols,
+                                n_layers=cfg.n_layers,
+                                mcs_table=cfg.mcs_table)
 
         # ── TX ────────────────────────────────────────────────────────────────
         self.mapper    = Mapper(self.Qm)
+        self.llr_computer = LLRComputer(self.Qm, cfg.snr_db)
         self.modulator = OFDMModulator(
-            mu=cfg.numerology, n_fft=cfg.n_fft,
-            n_prb=cfg.n_prb,   cp_len=cfg.cp_len,
+            mu=cfg.numerology, n_fft=cfg.n_fft_eff,
+            n_prb=cfg.n_prb_eff, cp_len=cfg.cp_len_eff,
         )
         self.n_sc    = self.modulator.n_sc
         self.e_bits  = self.n_sc * self.Qm
@@ -125,14 +132,21 @@ class LinkSimulator:
             'AWGN':    AWGNChannel(cfg.snr_db),
             'Rayleigh':RayleighChannel(cfg.snr_db, n_tx=1, n_rx=1),
             'CDL-A':   CDLChannel('CDL-A', cfg.snr_db, cfg.velocity_kmh,
-                                  cfg.scs_khz * 1e3, cfg.n_fft, n_tx=1, n_rx=1),
+                                  cfg.scs_hz, cfg.n_fft_eff, n_tx=1, n_rx=1),
             'CDL-B':   CDLChannel('CDL-B', cfg.snr_db, cfg.velocity_kmh,
-                                  cfg.scs_khz * 1e3, cfg.n_fft, n_tx=1, n_rx=1),
+                                  cfg.scs_hz, cfg.n_fft_eff, n_tx=1, n_rx=1),
             'CDL-C':   CDLChannel('CDL-C', cfg.snr_db, cfg.velocity_kmh,
-                                  cfg.scs_khz * 1e3, cfg.n_fft, n_tx=1, n_rx=1),
+                                  cfg.scs_hz, cfg.n_fft_eff, n_tx=1, n_rx=1),
+            'TDL-A':   AWGNChannel(cfg.snr_db),  # TDL placeholder → AWGN
+            'TDL-B':   AWGNChannel(cfg.snr_db),
+            'TDL-C':   AWGNChannel(cfg.snr_db),
+            'TDL-D':   AWGNChannel(cfg.snr_db),
+            'TDL-E':   AWGNChannel(cfg.snr_db),
         }
         self.channel  = ch_map.get(cfg.channel_model, AWGNChannel(cfg.snr_db))
-        self._is_awgn = cfg.channel_model == 'AWGN'
+        self._is_awgn = cfg.channel_model in (
+            'AWGN', 'TDL-A', 'TDL-B', 'TDL-C', 'TDL-D', 'TDL-E'
+        )
 
         # ── RX ────────────────────────────────────────────────────────────────
         self.demodulator  = self.modulator
@@ -150,7 +164,7 @@ class LinkSimulator:
         # ── Metrics ───────────────────────────────────────────────────────────
         self.ber_ctr  = BERCounter()
         self.bler_ctr = BLERCounter()
-        self.tput     = ThroughputCalc(cfg.slot_duration_us)
+        self.tput     = ThroughputCalc(cfg.slot_duration_us, bw_hz=cfg.bw_mhz*1e6)
 
     # ── TX ────────────────────────────────────────────────────────────────────
 
@@ -285,7 +299,10 @@ class LinkSimulator:
             bler=self.bler_ctr.bler,
             throughput=self.tput.avg_throughput_mbps,
             peak_tput=peak,
+            spectral_eff=self.tput.spectral_efficiency,
             avg_mcs=float(np.mean(mcs_accum)) if mcs_accum else float(self.cfg.mcs),
+            channel=self.cfg.channel_model,
+            bw_mhz=self.cfg.bw_mhz,
             n_slots=n_slots,
             n_harq_tx=n_harq_tx,
             n_harq_retx=n_retx,

@@ -91,8 +91,9 @@ class ThroughputCalc:
     slot_duration_us : slot duration in microseconds (default: 0.5ms for μ=1)
     """
 
-    def __init__(self, slot_duration_us: float = 500.0):
+    def __init__(self, slot_duration_us: float = 500.0, bw_hz: float = 20e6):
         self.slot_duration_us = slot_duration_us
+        self._bw_hz = bw_hz
         self._total_bits: int = 0
         self._total_slots: int = 0
         self._tput_history: list[float] = []
@@ -126,9 +127,12 @@ class ThroughputCalc:
 
     @property
     def spectral_efficiency(self) -> float:
-        """Bits/s/Hz (assumes 20 MHz bandwidth by default)."""
-        bw_hz = 20e6
-        return self.avg_throughput_mbps * 1e6 / bw_hz
+        """Bits/s/Hz based on configured bandwidth."""
+        return self.avg_throughput_mbps * 1e6 / max(self._bw_hz, 1.0)
+
+    def set_bandwidth(self, bw_hz: float):
+        """Set channel bandwidth for spectral efficiency calculation."""
+        self._bw_hz = bw_hz
 
     def reset(self):
         self._total_bits = 0
@@ -147,3 +151,4 @@ class ThroughputCalc:
     def __repr__(self) -> str:
         return (f"ThroughputCalc(avg={self.avg_throughput_mbps:.3f} Mbps, "
                 f"slots={self._total_slots})")
+    
