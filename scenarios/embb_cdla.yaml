@@ -1,0 +1,24 @@
+# scenarios/embb_cdla.yaml
+# eMBB: enhanced Mobile Broadband — 100 MHz, CDL-A, SNR sweep
+# Run: python run_sim.py --config scenarios/embb_cdla.yaml --workers 4
+
+numerology: 1
+bw_mhz: 100
+mcs_table: qam64
+n_layers: 1
+channel_model: CDL-A
+velocity_kmh: 30.0
+carrier_freq_ghz: 3.5
+n_tx: 4
+n_rx: 2
+detector: MMSE
+harq_processes: 8
+max_harq_tx: 4
+harq_combining: IR
+target_bler: 0.1
+olla_enabled: true
+seed: 42
+n_slots: 500
+
+sweep_param: snr_db
+sweep_values: [-5, 0, 5, 10, 15, 20, 25, 30]

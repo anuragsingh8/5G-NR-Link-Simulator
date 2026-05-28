@@ -1,0 +1,26 @@
+# scenarios/urllc.yaml
+# URLLC: Ultra-Reliable Low-Latency — FR2, TDL-C, low MCS, no HARQ retx
+# Run: python run_sim.py --config scenarios/urllc.yaml
+
+numerology: 3
+bw_mhz: 100
+mcs: 4
+mcs_table: qam64lr
+n_layers: 1
+channel_model: TDL-C
+delay_spread_ns: 30.0
+velocity_kmh: 3.0
+carrier_freq_ghz: 28.0
+n_tx: 1
+n_rx: 1
+detector: MMSE
+harq_processes: 4
+max_harq_tx: 1
+harq_combining: CC
+target_bler: 0.00001
+olla_enabled: false
+seed: 42
+n_slots: 200
+
+sweep_param: snr_db
+sweep_values: [0, 5, 10, 15, 20, 25]

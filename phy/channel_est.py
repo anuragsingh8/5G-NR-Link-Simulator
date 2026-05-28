@@ -1,338 +1,331 @@
 """
 phy/channel_est.py — Channel Estimators
+=========================================
+3GPP TS 38.211 Section 7.4 (DMRS)
 
-This module contains simple pilot-based channel estimators:
+Estimators
+----------
+  LSEstimator    — Least Squares at DMRS pilots, linear freq interpolation
+  LMMSEEstimator — Linear MMSE, exponential spatial correlation model
+  SlotEstimator  — Full slot estimator: DMRS-based, freq + time interpolation
 
-  • LSEstimator
-      Least Squares estimator using DMRS pilot tones.
+DMRS patterns (TS 38.211 §7.4.1.1)
+  Type 1 comb-2: pilots on even subcarriers (default)
+  Type 2 comb-4: pilots on subcarriers 0,2,6,8 within each PRB
 
-  • LMMSEEstimator
-      Linear Minimum Mean Square Error estimator using a simple
-      frequency-domain channel correlation model.
-
-Reference:
-  3GPP TS 38.211 Section 7.4 — DMRS
+Pilot symbols within a slot (Type A mapping):
+  Single-symbol DMRS: symbols 2 and 11 (l0=2, additional=11)
+  Double-symbol DMRS: symbols 2,3 and 11,12
 """
 
 from __future__ import annotations
-
 import numpy as np
+from typing import Literal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DMRS pilot pattern
-# ─────────────────────────────────────────────────────────────────────────────
-# This is a simplified Type-1, single-port DMRS pattern.
-#
-# Assumption:
-#   • DMRS pilots occupy even-numbered subcarriers.
-#   • Pilot OFDM symbols are assumed to occur at symbol indices 2 and 11
-#     within a slot, although this file estimates one received pilot symbol
-#     at a time.
-#
-# Note:
-#   This is not a full 3GPP-complete DMRS implementation. It is a lightweight
-#   pilot pattern suitable for simulation and estimator testing.
+# DMRS sequence generation  (TS 38.211 §7.4.1.1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def generate_dmrs_pilots(n_subcarriers: int, seed: int = 42) -> np.ndarray:
+def generate_dmrs_sequence(n_sc: int, seed: int = 42) -> np.ndarray:
     """
-    Generate a deterministic QPSK DMRS pilot sequence.
+    Generate Gold-code DMRS sequence of length n_sc.
+    Simplified: uses QPSK mapping of a PN sequence.
+    Full spec uses Gold code initialised from slot/symbol/port indices.
+    Returns (n_sc,) complex array, |d|=1.
+    """
+    rng  = np.random.default_rng(seed)
+    bits = rng.integers(0, 2, size=2 * n_sc)
+    return (1 - 2 * bits[:n_sc] + 1j * (1 - 2 * bits[n_sc:])) / np.sqrt(2)
+
+
+def dmrs_pilot_subcarriers(
+    n_sc:      int,
+    dmrs_type: int = 1,
+) -> np.ndarray:
+    """
+    Return subcarrier indices carrying DMRS pilots.
+
+    Type 1 (comb-2): every even SC within the allocation → n_sc/2 pilots
+    Type 2 (comb-4): SCs 0,2,6,8 per PRB → n_sc*4/12 pilots
+    """
+    if dmrs_type == 1:
+        return np.arange(0, n_sc, 2)
+    else:  # Type 2
+        pilots = []
+        for prb in range(n_sc // 12):
+            base = prb * 12
+            pilots.extend([base, base+2, base+6, base+8])
+        return np.array(pilots)
+
+
+def dmrs_symbol_positions(
+    n_symb:      int  = 14,
+    mapping:     Literal['typeA', 'typeB'] = 'typeA',
+    additional:  bool = True,
+) -> list[int]:
+    """
+    OFDM symbol indices within a slot that carry DMRS.
+
+    Type A (data from symbol 0): first DMRS at symbol 2
+    Type B (data from symbol 0): first DMRS at symbol 0
 
     Parameters
     ----------
-    n_subcarriers : int
-        Total number of active OFDM subcarriers.
-
-    seed : int
-        Random seed used to make the generated pilot sequence repeatable.
-
-    Returns
-    -------
-    np.ndarray
-        Complex QPSK pilot symbols with shape ``(n_subcarriers // 2,)``.
-        Each pilot has unit average magnitude.
+    additional : include additional DMRS position (symbol 11 for typeA)
     """
-
-    # Create a NumPy random number generator with a fixed seed so that the
-    # same pilot sequence is produced every time for the same input settings.
-    rng = np.random.default_rng(seed)
-
-    # Generate two random bits per QPSK symbol.
-    # Since pilots are placed on half of the subcarriers, the number of QPSK
-    # pilot symbols is n_subcarriers // 2.
-    bits = rng.integers(0, 2, size=2 * (n_subcarriers // 2))
-
-    # Map bit pairs to QPSK constellation symbols:
-    #
-    #   bit 0 controls the real part
-    #   bit 1 controls the imaginary part
-    #
-    # Mapping:
-    #   0 -> +1
-    #   1 -> -1
-    #
-    # Division by sqrt(2) normalizes the QPSK symbol power to 1.
-    pilots = (
-        1 - 2 * bits[0::2]
-        + 1j * (1 - 2 * bits[1::2])
-    ) / np.sqrt(2)
-
-    # Return one pilot symbol for every even-numbered subcarrier.
-    return pilots
+    if mapping == 'typeA':
+        pos = [2]
+        if additional and n_symb == 14:
+            pos.append(11)
+    else:
+        pos = [0]
+        if additional:
+            pos.append(4)
+    return pos
 
 
-def get_pilot_indices(n_subcarriers: int) -> np.ndarray:
+# ─────────────────────────────────────────────────────────────────────────────
+# Interpolation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _freq_interpolate(
+    pilot_idx: np.ndarray,
+    h_pilots:  np.ndarray,
+    n_sc:      int,
+) -> np.ndarray:
+    """Linear interpolation from pilot positions to all n_sc subcarriers."""
+    all_idx = np.arange(n_sc)
+    return (
+        np.interp(all_idx, pilot_idx, h_pilots.real)
+        + 1j * np.interp(all_idx, pilot_idx, h_pilots.imag)
+    )
+
+
+def _time_interpolate(
+    h_at_dmrs: np.ndarray,
+    dmrs_syms: list[int],
+    n_symb:    int,
+) -> np.ndarray:
     """
-    Return the subcarrier indices occupied by DMRS pilots.
+    Linear interpolation of H across all n_symb symbols.
 
     Parameters
     ----------
-    n_subcarriers : int
-        Total number of active OFDM subcarriers.
+    h_at_dmrs : (n_dmrs, n_sc) channel estimates at DMRS symbols
+    dmrs_syms : symbol indices of DMRS (sorted)
+    n_symb    : total symbols in slot
 
     Returns
     -------
-    np.ndarray
-        Even-numbered subcarrier indices:
-        ``[0, 2, 4, ..., n_subcarriers - 2]`` when n_subcarriers is even.
+    H_slot : (n_symb, n_sc) full-slot channel estimate
     """
+    n_sc = h_at_dmrs.shape[1]
+    H    = np.zeros((n_symb, n_sc), dtype=complex)
 
-    # Pilots are placed on every other subcarrier, starting at index 0.
-    return np.arange(0, n_subcarriers, 2)
+    if len(dmrs_syms) == 1:
+        # Single DMRS: constant across slot
+        H[:] = h_at_dmrs[0]
+        return H
 
+    sym_arr = np.array(dmrs_syms)
+    for k in range(n_sc):
+        H[:, k] = (
+            np.interp(np.arange(n_symb), sym_arr, h_at_dmrs[:, k].real)
+            + 1j * np.interp(np.arange(n_symb), sym_arr, h_at_dmrs[:, k].imag)
+        )
+    return H
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LS Estimator
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LSEstimator:
     """
-    Least Squares channel estimator.
-
-    The LS estimate is computed at pilot locations using:
-
-        H_ls[k] = Y[k] / X[k]
-
-    where:
-        Y[k] is the received pilot value,
-        X[k] is the known transmitted pilot value,
-        H_ls[k] is the channel estimate at pilot subcarrier k.
-
-    After estimating the channel on pilot subcarriers, the estimator performs
-    linear interpolation to obtain channel estimates for all subcarriers.
+    Least-Squares channel estimator from a single DMRS symbol.
+    H_ls[k] = RX[k] / DMRS[k] at pilot positions, then linear interpolation.
 
     Parameters
     ----------
-    n_subcarriers : int
-        Total number of active OFDM subcarriers.
-    """
-
-    def __init__(self, n_subcarriers: int = 624):
-        """
-        Initialize the LS estimator.
-
-        Parameters
-        ----------
-        n_subcarriers : int
-            Total number of active OFDM subcarriers.
-        """
-
-        # Store the number of active subcarriers used by the OFDM system.
-        self.n_subcarriers = n_subcarriers
-
-        # Compute the subcarrier locations that carry DMRS pilots.
-        self.pilot_idx = get_pilot_indices(n_subcarriers)
-
-        # Generate the known transmitted DMRS pilot symbols.
-        self.pilots = generate_dmrs_pilots(n_subcarriers)
-
-        # Store all subcarrier indices. These are the target points where the
-        # final interpolated channel estimate will be evaluated.
-        self.data_idx = np.arange(n_subcarriers)
-
-    def estimate(self, rx_pilot_symbol: np.ndarray) -> np.ndarray:
-        """
-        Estimate the channel from one received OFDM pilot symbol.
-
-        Parameters
-        ----------
-        rx_pilot_symbol : np.ndarray
-            Received OFDM symbol with shape ``(n_subcarriers,)``.
-            Pilot values are read from the known DMRS pilot positions.
-
-        Returns
-        -------
-        np.ndarray
-            Complex channel estimate with shape ``(n_subcarriers,)``.
-            Values at non-pilot subcarriers are obtained by interpolation.
-        """
-
-        # Extract the received values at pilot subcarriers and divide them by
-        # the known transmitted pilots. This gives the LS channel estimate at
-        # pilot positions only.
-        h_pilot = rx_pilot_symbol[self.pilot_idx] / self.pilots
-
-        # Interpolate the real part of the pilot channel estimates from pilot
-        # positions to every active subcarrier.
-        h_real = np.interp(
-            self.data_idx,
-            self.pilot_idx,
-            h_pilot.real,
-        )
-
-        # Interpolate the imaginary part separately because np.interp operates
-        # on real-valued data.
-        h_imag = np.interp(
-            self.data_idx,
-            self.pilot_idx,
-            h_pilot.imag,
-        )
-
-        # Recombine the interpolated real and imaginary parts into a complex
-        # channel estimate.
-        h_est = h_real + 1j * h_imag
-
-        # Return the full-band channel estimate.
-        return h_est
-
-
-class LMMSEEstimator:
-    """
-    Linear Minimum Mean Square Error channel estimator.
-
-    The estimator first computes the LS estimate at pilot locations, then
-    applies an LMMSE filtering matrix:
-
-        H_lmmse = R_hh (R_hh + (1 / SNR) I)^(-1) H_ls
-
-    where:
-        R_hh is the pilot-domain channel correlation matrix,
-        SNR is the linear signal-to-noise ratio,
-        I is the identity matrix,
-        H_ls is the LS channel estimate at pilot positions.
-
-    The pilot-domain LMMSE estimate is then linearly interpolated to all
-    subcarriers.
-
-    Parameters
-    ----------
-    n_subcarriers : int
-        Number of active OFDM subcarriers.
-
-    snr_db : float
-        Operating SNR in dB. Used to regularize the LMMSE filter.
-
-    coherence_bw : float
-        Coherence bandwidth measured in subcarrier spacings. Larger values
-        imply a smoother frequency-domain channel.
+    n_subcarriers : active subcarriers
+    dmrs_type     : 1 (comb-2) or 2 (comb-4)
+    seed          : DMRS sequence seed
     """
 
     def __init__(
         self,
-        n_subcarriers: int = 624,
-        snr_db: float = 15.0,
-        coherence_bw: float = 50.0,
+        n_subcarriers: int  = 624,
+        dmrs_type:     int  = 1,
+        seed:          int  = 42,
     ):
+        self.n_sc      = n_subcarriers
+        self.pilot_idx = dmrs_pilot_subcarriers(n_subcarriers, dmrs_type)
+        seq            = generate_dmrs_sequence(n_subcarriers, seed)
+        self.pilots    = seq[self.pilot_idx]
+
+    def estimate(self, rx_symbol: np.ndarray) -> np.ndarray:
         """
-        Initialize the LMMSE estimator.
+        Estimate H from one received DMRS OFDM symbol.
 
         Parameters
         ----------
-        n_subcarriers : int
-            Number of active OFDM subcarriers.
-
-        snr_db : float
-            Signal-to-noise ratio in decibels.
-
-        coherence_bw : float
-            Controls the exponential decay of frequency correlation.
-        """
-
-        # Store OFDM size.
-        self.n_subcarriers = n_subcarriers
-
-        # Store SNR in dB for reference and reproducibility.
-        self.snr_db = snr_db
-
-        # Compute pilot subcarrier positions.
-        self.pilot_idx = get_pilot_indices(n_subcarriers)
-
-        # Generate the known transmitted DMRS pilots.
-        self.pilots = generate_dmrs_pilots(n_subcarriers)
-
-        # Store all subcarrier indices for the final interpolation step.
-        self.data_idx = np.arange(n_subcarriers)
-
-        # Count how many pilot tones are used.
-        self.n_pilots = len(self.pilot_idx)
-
-        # Compute the pairwise distance between pilot subcarriers.
-        # subtract.outer(a, a) forms a matrix where element (i, j) is:
-        #
-        #   pilot_idx[i] - pilot_idx[j]
-        #
-        # Taking the absolute value gives frequency separation between pilots.
-        d = np.abs(np.subtract.outer(self.pilot_idx, self.pilot_idx))
-
-        # Build a simple exponential channel correlation matrix.
-        #
-        # Nearby pilot subcarriers are assumed to have highly correlated
-        # channel responses. Correlation decays as frequency distance grows.
-        self._R_hh = np.exp(-d / coherence_bw).astype(complex)
-
-        # Convert SNR from dB to linear scale:
-        #
-        #   SNR_linear = 10^(SNR_dB / 10)
-        snr_lin = 10 ** (snr_db / 10)
-
-        # Build the LMMSE filter matrix:
-        #
-        #   W = R_hh @ inv(R_hh + noise_variance * I)
-        #
-        # Here, noise_variance is approximated as 1 / SNR_linear.
-        # The identity term prevents overfitting noisy LS estimates.
-        self._W = self._R_hh @ np.linalg.inv(
-            self._R_hh + np.eye(self.n_pilots) / snr_lin
-        )
-
-    def estimate(self, rx_pilot_symbol: np.ndarray) -> np.ndarray:
-        """
-        Estimate the channel from one received OFDM pilot symbol.
-
-        Parameters
-        ----------
-        rx_pilot_symbol : np.ndarray
-            Received OFDM symbol with shape ``(n_subcarriers,)``.
+        rx_symbol : (n_sc,) received symbols — DMRS symbol row from slot grid
 
         Returns
         -------
-        np.ndarray
-            Complex LMMSE channel estimate with shape ``(n_subcarriers,)``.
-            The estimate is filtered at pilot positions and interpolated across
-            the full frequency band.
+        H_est : (n_sc,) interpolated channel estimate
         """
+        h_p = rx_symbol[self.pilot_idx] / (self.pilots + 1e-12)
+        return _freq_interpolate(self.pilot_idx, h_p, self.n_sc)
 
-        # Compute the raw LS estimate at pilot subcarriers.
-        h_ls = rx_pilot_symbol[self.pilot_idx] / self.pilots
 
-        # Apply the precomputed LMMSE filter matrix to suppress noise using
-        # the assumed channel correlation structure.
+# ─────────────────────────────────────────────────────────────────────────────
+# LMMSE Estimator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LMMSEEstimator:
+    """
+    Linear MMSE channel estimator.
+
+    H_lmmse = R_hh (R_hh + σ² I)^{-1} H_ls
+
+    R_hh modelled as exponentially decaying across pilot separation.
+
+    Parameters
+    ----------
+    n_subcarriers : active subcarriers
+    snr_db        : regularisation SNR
+    coherence_bw  : coherence bandwidth in subcarrier spacings
+    dmrs_type     : 1 or 2
+    seed          : DMRS seed
+    """
+
+    def __init__(
+        self,
+        n_subcarriers: int   = 624,
+        snr_db:        float = 15.0,
+        coherence_bw:  float = 50.0,
+        dmrs_type:     int   = 1,
+        seed:          int   = 42,
+    ):
+        self.n_sc      = n_subcarriers
+        self.pilot_idx = dmrs_pilot_subcarriers(n_subcarriers, dmrs_type)
+        seq            = generate_dmrs_sequence(n_subcarriers, seed)
+        self.pilots    = seq[self.pilot_idx]
+        self.n_pilots  = len(self.pilot_idx)
+
+        d        = np.abs(np.subtract.outer(self.pilot_idx, self.pilot_idx))
+        R_hh     = np.exp(-d / coherence_bw).astype(complex)
+        snr_lin  = 10 ** (snr_db / 10)
+        self._W  = R_hh @ np.linalg.inv(R_hh + np.eye(self.n_pilots) / snr_lin)
+
+    def estimate(self, rx_symbol: np.ndarray) -> np.ndarray:
+        """
+        LMMSE estimate from one received DMRS OFDM symbol.
+
+        Parameters
+        ----------
+        rx_symbol : (n_sc,) received symbol
+
+        Returns
+        -------
+        H_est : (n_sc,) complex channel estimate
+        """
+        h_ls    = rx_symbol[self.pilot_idx] / (self.pilots + 1e-12)
         h_lmmse = self._W @ h_ls
+        return _freq_interpolate(self.pilot_idx, h_lmmse, self.n_sc)
 
-        # Interpolate the real part of the LMMSE pilot estimates.
-        h_real = np.interp(
-            self.data_idx,
-            self.pilot_idx,
-            h_lmmse.real,
-        )
 
-        # Interpolate the imaginary part of the LMMSE pilot estimates.
-        h_imag = np.interp(
-            self.data_idx,
-            self.pilot_idx,
-            h_lmmse.imag,
-        )
+# ─────────────────────────────────────────────────────────────────────────────
+# Full Slot Estimator (DMRS-based, freq + time interpolation)
+# ─────────────────────────────────────────────────────────────────────────────
 
-        # Combine real and imaginary parts into the final complex estimate.
-        h_est = h_real + 1j * h_imag
+class SlotEstimator:
+    """
+    Full-slot channel estimator.
 
-        # Return the full-subcarrier channel estimate.
-        return h_est
+    Processes a complete (n_symb × n_sc) received slot grid:
+      1. Extract received symbols at DMRS positions
+      2. Divide by known DMRS sequence → LS estimate at pilot SCs
+      3. LMMSE smoothing across pilot subcarriers
+      4. Interpolate across all subcarriers (frequency domain)
+      5. Interpolate across all symbols (time domain)
+
+    This is the production estimation chain for OFDM with DMRS.
+
+    Parameters
+    ----------
+    n_sc          : active subcarriers
+    n_symb        : symbols per slot (14 for normal CP)
+    snr_db        : regularisation SNR for LMMSE
+    dmrs_type     : 1 (comb-2) or 2 (comb-4)
+    dmrs_mapping  : 'typeA' or 'typeB'
+    use_lmmse     : True = LMMSE, False = plain LS
+    seed          : DMRS sequence seed
+    """
+
+    def __init__(
+        self,
+        n_sc:         int   = 624,
+        n_symb:       int   = 14,
+        snr_db:       float = 15.0,
+        dmrs_type:    int   = 1,
+        dmrs_mapping: str   = 'typeA',
+        use_lmmse:    bool  = True,
+        seed:         int   = 42,
+    ):
+        self.n_sc        = n_sc
+        self.n_symb      = n_symb
+        self.dmrs_syms   = dmrs_symbol_positions(n_symb, dmrs_mapping)
+        self.pilot_idx   = dmrs_pilot_subcarriers(n_sc, dmrs_type)
+        self.n_pilots    = len(self.pilot_idx)
+
+        # DMRS sequences per symbol (same sequence, different seeds could model ports)
+        self.dmrs_seq    = {}
+        for s in self.dmrs_syms:
+            seq = generate_dmrs_sequence(n_sc, seed + s)
+            self.dmrs_seq[s] = seq[self.pilot_idx]
+
+        # LMMSE weight matrix
+        if use_lmmse:
+            d       = np.abs(np.subtract.outer(self.pilot_idx, self.pilot_idx))
+            R       = np.exp(-d / max(50.0, n_sc // 12)).astype(complex)
+            snr_lin = 10 ** (snr_db / 10)
+            self._W = R @ np.linalg.inv(R + np.eye(self.n_pilots) / snr_lin)
+        else:
+            self._W = np.eye(self.n_pilots)
+
+    def generate_slot_dmrs(self) -> dict[int, np.ndarray]:
+        """
+        Return known DMRS symbols for TX grid injection.
+        {symbol_idx: (n_sc,) array, zeros at non-pilot SCs}
+        """
+        out = {}
+        for s, pilots in self.dmrs_seq.items():
+            row = np.zeros(self.n_sc, dtype=complex)
+            row[self.pilot_idx] = pilots
+            out[s] = row
+        return out
+
+    def estimate_slot(self, rx_grid: np.ndarray) -> np.ndarray:
+        """
+        Estimate H across full slot.
+
+        Parameters
+        ----------
+        rx_grid : (n_symb, n_sc) received slot grid
+
+        Returns
+        -------
+        H_slot : (n_symb, n_sc) complex channel estimate per symbol per SC
+        """
+        h_at_dmrs = np.zeros((len(self.dmrs_syms), self.n_sc), dtype=complex)
+
+        for i, sym in enumerate(self.dmrs_syms):
+            rx_pilots  = rx_grid[sym, self.pilot_idx]
+            h_ls       = rx_pilots / (self.dmrs_seq[sym] + 1e-12)
+            h_smooth   = self._W @ h_ls   # LMMSE or identity
+            h_at_dmrs[i] = _freq_interpolate(self.pilot_idx, h_smooth, self.n_sc)
+
+        return _time_interpolate(h_at_dmrs, self.dmrs_syms, self.n_symb)

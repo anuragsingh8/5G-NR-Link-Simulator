@@ -268,4 +268,5 @@ class LLRComputer:
             min0 = dist[:, self._idx0[k]].min(axis=1)
             min1 = dist[:, self._idx1[k]].min(axis=1)
             llrs[k::m] = (min1 - min0) / s2_per_sc
+
         return llrs

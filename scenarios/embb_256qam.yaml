@@ -1,0 +1,22 @@
+# scenarios/embb_256qam.yaml
+# eMBB 256QAM: high spectral efficiency — 100 MHz, AWGN, 256QAM MCS sweep
+# Run: python run_sim.py --config scenarios/embb_256qam.yaml
+
+numerology: 1
+bw_mhz: 100
+mcs_table: qam256
+channel_model: AWGN
+n_tx: 4
+n_rx: 4
+n_layers: 1
+detector: MMSE
+harq_processes: 8
+max_harq_tx: 4
+harq_combining: IR
+snr_db: 25.0
+velocity_kmh: 0.0
+seed: 42
+n_slots: 300
+
+sweep_param: mcs
+sweep_values: [0, 4, 8, 12, 16, 20, 24, 27]
